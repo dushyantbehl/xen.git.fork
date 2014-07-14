@@ -70,6 +70,8 @@ GUEST_SRCS-$(CONFIG_ARM)     += xc_dom_armzimageloader.c
 GUEST_SRCS-y                 += xc_dom_binloader.c
 GUEST_SRCS-y                 += xc_dom_compat_linux.c
 
+GUEST_SRCS-y                 += xc_mem_paging_setup.c
+
 GUEST_SRCS-$(CONFIG_X86)     += xc_dom_x86.c
 GUEST_SRCS-$(CONFIG_X86)     += xc_cpuid_x86.c
 GUEST_SRCS-$(CONFIG_X86)     += xc_hvm_build_x86.c

@@ -32,6 +32,8 @@
 #define X86_64_B_SIZE   64 
 #define X86_32_B_SIZE   32
 
+#include <xen/mem_event.h>
+
 /* callbacks provided by xc_domain_save */
 struct save_callbacks {
     /* Called after expiration of checkpoint interval,
@@ -322,4 +324,44 @@ xen_pfn_t *xc_map_m2p(xc_interface *xch,
                       unsigned long max_mfn,
                       int prot,
                       unsigned long *mfn0);
+
+/**
+ * Mem paging ring and event channel setup routine.
+ * Setup a shared ring and an event channel to communicate between
+ * hypervisor and the tool performing mem paging operations.
+ * The function will return zero on successful completion and will
+ * return -1 on failure at any intermediate step setting up errno
+ * properly.
+ * @parm xch a handle to an open hypervisor interface
+ * @parm xce_handle a handle to an open event channel
+ * @parm domain_id number identifier of the domain
+ * @parm ring_page passed NULL, returned pointer to the shared ring page
+ * @parm port pointer to the integer for storing event port
+ * @pram evtchn_port pointer to the integer for storing event channel port
+ * @pram back_ring pointer to the reader end of the memory event channel ring
+ */
+int xc_mem_paging_ring_setup(xc_interface *xch,
+                             xc_evtchn *xce_handle,
+                             domid_t domain_id,
+                             void *ring_page,
+                             int *port,
+                             uint32_t *evtchn_port,
+                             mem_event_back_ring_t *back_ring);
+/**
+ * Mem paging ring and event channel teardown routine.
+ * The function call invalidates the arguments ring_page and port.
+ * The function will return zero on successful completion and will
+ * return -1 on failure at any intermediate step setting up errno
+ * properly.
+ * @parm xch a handle to an open hypervisor interface
+ * @parm xce_handle a handle to an open event channel
+ * @parm domain_id number identifier of the domain
+ * @parm ring_page pointer to the shared ring page
+ * @parm port pointer to the integer storing event port
+ */
+int xc_mem_paging_ring_teardown(xc_interface *xch,
+                                 xc_evtchn *xce_handle,
+                                 domid_t domain_id,
+                                 void *ring_page,
+                                 int *port);
 #endif /* XENGUEST_H */
