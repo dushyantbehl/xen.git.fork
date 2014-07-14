@@ -76,6 +76,22 @@ int xc_mem_paging_ring_setup(xc_interface *xch,
         }
     }
 
+    /* Clear the ring_pfn */
+    memset(ring_page, 0, PAGE_SIZE);
+
+    rc = xc_domain_pause(xch, domain_id);
+    if ( rc != 0 )
+    {
+        PERROR("Unable to pause domain");
+        return -1;
+    }
+    DPRINTF("Domain pause successful");
+
+    /* Initialise ring */
+    SHARED_RING_INIT((mem_event_sring_t *)ring_page);
+    BACK_RING_INIT(back_ring, (mem_event_sring_t *)ring_page, PAGE_SIZE);
+    DPRINTF("ininialized shared ring");
+
     /* Initialise Xen */
     rc = xc_mem_paging_enable(xch, domain_id, evtchn_port);
     if ( rc != 0 )
@@ -99,6 +115,7 @@ int xc_mem_paging_ring_setup(xc_interface *xch,
         }
         return -1;
     }
+    DPRINTF("enabled mempaging");
 
     /* Bind event notification */
     rc = xc_evtchn_bind_interdomain(xce_handle, domain_id, *evtchn_port);
@@ -109,16 +126,20 @@ int xc_mem_paging_ring_setup(xc_interface *xch,
     }
     *port = rc;
 
-    /* Initialise ring */
-    SHARED_RING_INIT((mem_event_sring_t *)ring_page);
-    BACK_RING_INIT(back_ring, (mem_event_sring_t *)ring_page, PAGE_SIZE);
-
     /* Now that the ring is set, remove it from the guest's physmap */
     if ( xc_domain_decrease_reservation_exact(xch, domain_id, 1, 0, &ring_pfn) )
     {
         PERROR("Failed to remove ring_pfn from guest physmap");
         return -1;
     }
+
+    rc = xc_domain_unpause(xch, domain_id);
+    if ( rc != 0 )
+    {
+        PERROR("Unable to unpause domain");
+        return -1;
+    }
+    DPRINTF("Domain unpause successful");
 
     return 0;
 }
