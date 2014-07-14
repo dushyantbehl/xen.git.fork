@@ -43,7 +43,7 @@ int xc_mem_paging_ring_setup(xc_interface *xch,
                              uint32_t *evtchn_port,
                              mem_event_back_ring_t *back_ring)
 {
-    int rc;
+    int rc, err;
     uint64_t pfn;
     xen_pfn_t ring_pfn, mmap_pfn;
 
@@ -52,9 +52,9 @@ int xc_mem_paging_ring_setup(xc_interface *xch,
 
     ring_pfn = pfn;
     mmap_pfn = ring_pfn;
-    ring_page = xc_map_foreign_batch(xch, domain_id,
-                                        PROT_READ | PROT_WRITE, &mmap_pfn, 1);
-    if ( mmap_pfn & XEN_DOMCTL_PFINFO_XTAB )
+    ring_page = xc_map_foreign_bulk(xch, domain_id,
+                                    PROT_READ | PROT_WRITE, &mmap_pfn, &err, 1);
+    if ( (err != 0) || (ring_page == NULL) )
     {
         /* Map failed, populate ring page */
         rc = xc_domain_populate_physmap_exact(xch, domain_id,
@@ -66,10 +66,10 @@ int xc_mem_paging_ring_setup(xc_interface *xch,
         }
 
         mmap_pfn = ring_pfn;
-        ring_page = xc_map_foreign_batch(xch, domain_id,
-                                        PROT_READ | PROT_WRITE, &mmap_pfn, 1);
+        ring_page = xc_map_foreign_bulk(xch, domain_id, PROT_READ | PROT_WRITE,
+                                        &mmap_pfn, &err, 1);
 
-        if ( mmap_pfn & XEN_DOMCTL_PFINFO_XTAB )
+        if ( (err != 0) || (ring_page == NULL) )
         {
             PERROR("Could not map the ring page\n");
             return -1;
