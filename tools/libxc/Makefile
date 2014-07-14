@@ -61,6 +61,8 @@ GUEST_SRCS-y += $(ELF_SRCS-y)
 $(patsubst %.c,%.o,$(ELF_SRCS-y)): CFLAGS += -Wno-pointer-sign
 $(patsubst %.c,%.opic,$(ELF_SRCS-y)): CFLAGS += -Wno-pointer-sign
 
+GUEST_SRCS-y                 += hashtable.c
+
 # new domain builder
 GUEST_SRCS-y                 += xc_dom_core.c xc_dom_boot.c
 GUEST_SRCS-y                 += xc_dom_elfloader.c

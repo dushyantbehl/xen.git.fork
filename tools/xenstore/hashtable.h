@@ -3,6 +3,7 @@
 /*
  * There are duplicates of this code in:
  *  - tools/blktap2/drivers/hashtable.h
+ *  - tools/libxc/hashtable.h
  */
 
 #ifndef __HASHTABLE_CWC22_H__

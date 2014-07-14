@@ -3,7 +3,7 @@
 /*
  * There are duplicates of this code in:
  *  - tools/blktap2/drivers/hashtable.c
- *  - tools/libxc/hashtable.c
+ *  - tools/xenstore/hashtable.c
  */
 
 #include "hashtable.h"

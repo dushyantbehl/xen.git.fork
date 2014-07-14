@@ -3,6 +3,7 @@
 /*
  * There are duplicates of this code in:
  *  - tools/xenstore/hashtable.c
+ *  - tools/libxc/hashtable.c
  */
 
 #include "hashtable.h"
