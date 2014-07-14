@@ -143,6 +143,7 @@ struct domain_create {
     int paused;
     int dryrun;
     int quiet;
+    int lazy;
     int vnc;
     int vncautopass;
     int console_autoconnect;
@@ -2017,6 +2018,7 @@ static uint32_t create_domain(struct domain_create *dom_info)
     int daemonize = dom_info->daemonize;
     int monitor = dom_info->monitor;
     int paused = dom_info->paused;
+    int lazy = dom_info->lazy;
     int vncautopass = dom_info->vncautopass;
     const char *config_file = dom_info->config_file;
     const char *extra_config = dom_info->extra_config;
@@ -2209,7 +2211,14 @@ start:
 
     if ( restoring ) {
         libxl_domain_restore_params params;
+        libxl_domain_create_info *c_info = &d_config.c_info;
+        if ( lazy && (c_info->type != LIBXL_DOMAIN_TYPE_HVM) ) {
+            fprintf(stderr, "lazy restore should be called for HVM guest only");
+            ret = ERROR_INVAL;
+            goto error_out;
+        }
         params.checkpointed_stream = dom_info->checkpointed_stream;
+        params.lazy = lazy;
         ret = libxl_domain_create_restore(ctx, &d_config,
                                           &domid, restore_fd,
                                           &params,
@@ -3865,7 +3874,7 @@ int main_restore(int argc, char **argv)
     const char *config_file = NULL;
     struct domain_create dom_info;
     int paused = 0, debug = 0, daemonize = 1, monitor = 1,
-        console_autoconnect = 0, vnc = 0, vncautopass = 0;
+        console_autoconnect = 0, vnc = 0, vncautopass = 0, lazy = 0;
     int opt, rc;
     static struct option opts[] = {
         {"vncviewer", 0, 0, 'V'},
@@ -3874,7 +3883,7 @@ int main_restore(int argc, char **argv)
         {0, 0, 0, 0}
     };
 
-    SWITCH_FOREACH_OPT(opt, "FhcpdeVA", opts, "restore", 1) {
+    SWITCH_FOREACH_OPT(opt, "FhcpdleVA", opts, "restore", 1) {
     case 'c':
         console_autoconnect = 1;
         break;
@@ -3897,6 +3906,9 @@ int main_restore(int argc, char **argv)
     case 'A':
         vnc = vncautopass = 1;
         break;
+    case 'l':
+        lazy = 1;
+        break;
     }
 
     if (argc-optind == 1) {
@@ -3917,6 +3929,7 @@ int main_restore(int argc, char **argv)
     dom_info.config_file = config_file;
     dom_info.restore_file = checkpoint_file;
     dom_info.migrate_fd = -1;
+    dom_info.lazy = lazy;
     dom_info.vnc = vnc;
     dom_info.vncautopass = vncautopass;
     dom_info.console_autoconnect = console_autoconnect;

@@ -245,6 +245,7 @@ int main(int argc, char **argv)
         int superpages =           strtoul(NEXTARG,0,10);
         unsigned cbflags =         strtoul(NEXTARG,0,10);
         int checkpointed =         strtoul(NEXTARG,0,10);
+        int lazy =                 strtoul(NEXTARG,0,10);
         assert(!*++argv);
 
         helper_setcallbacks_restore(&helper_restore_callbacks, cbflags);
@@ -256,7 +257,7 @@ int main(int argc, char **argv)
         r = xc_domain_restore(xch, io_fd, dom, store_evtchn, &store_mfn,
                               store_domid, console_evtchn, &console_mfn,
                               console_domid, hvm, pae, superpages,
-                              checkpointed,
+                              checkpointed, lazy,
                               &helper_restore_callbacks);
         helper_stub_restore_results(store_mfn,console_mfn,0);
         complete(r);

@@ -483,6 +483,14 @@ typedef struct libxl__ctx libxl_ctx;
 #define LIBXL_HAVE_DOMAIN_CREATE_RESTORE_PARAMS 1
 
 /*
+ * LIBXL_HAVE_DOMAIN_RESTORE_PARAMS_LAZY 1
+ *
+ * If this is defined, libxl_domain_restore_params struct has a new
+ * integer field 'lazy' to enable lazy restore.
+ */
+#define LIBXL_HAVE_DOMAIN_RESTORE_PARAMS_LAZY 1
+
+/*
  * LIBXL_HAVE_CREATEINFO_PVH
  * If this is defined, then libxl supports creation of a PVH guest.
  */

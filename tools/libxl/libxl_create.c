@@ -1398,8 +1398,8 @@ static void domain_create_cb(libxl__egc *egc,
                              int rc, uint32_t domid);
 
 static int do_domain_create(libxl_ctx *ctx, libxl_domain_config *d_config,
-                            uint32_t *domid,
-                            int restore_fd, int checkpointed_stream,
+                            uint32_t *domid, int restore_fd,
+                            const libxl_domain_restore_params *restore_params,
                             const libxl_asyncop_how *ao_how,
                             const libxl_asyncprogress_how *aop_console_how)
 {
@@ -1411,9 +1411,13 @@ static int do_domain_create(libxl_ctx *ctx, libxl_domain_config *d_config,
     cdcs->dcs.guest_config = d_config;
     cdcs->dcs.restore_fd = restore_fd;
     cdcs->dcs.callback = domain_create_cb;
-    cdcs->dcs.checkpointed_stream = checkpointed_stream;
     libxl__ao_progress_gethow(&cdcs->dcs.aop_console_how, aop_console_how);
     cdcs->domid_out = domid;
+
+    if (restore_params) {
+        cdcs->dcs.checkpointed_stream = restore_params->checkpointed_stream;
+        cdcs->dcs.lazy = restore_params->lazy;
+    }
 
     initiate_domain_create(egc, &cdcs->dcs);
 
@@ -1438,7 +1442,7 @@ int libxl_domain_create_new(libxl_ctx *ctx, libxl_domain_config *d_config,
                             const libxl_asyncop_how *ao_how,
                             const libxl_asyncprogress_how *aop_console_how)
 {
-    return do_domain_create(ctx, d_config, domid, -1, 0,
+    return do_domain_create(ctx, d_config, domid, -1, NULL,
                             ao_how, aop_console_how);
 }
 
@@ -1449,7 +1453,7 @@ int libxl_domain_create_restore(libxl_ctx *ctx, libxl_domain_config *d_config,
                                 const libxl_asyncprogress_how *aop_console_how)
 {
     return do_domain_create(ctx, d_config, domid, restore_fd,
-                            params->checkpointed_stream, ao_how, aop_console_how);
+                            params, ao_how, aop_console_how);
 }
 
 /*

@@ -1431,7 +1431,7 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
                       domid_t store_domid, unsigned int console_evtchn,
                       unsigned long *console_mfn, domid_t console_domid,
                       unsigned int hvm, unsigned int pae, int superpages,
-                      int checkpointed_stream,
+                      int checkpointed_stream, int lazy,
                       struct restore_callbacks *callbacks)
 {
     DECLARE_DOMCTL;
@@ -1491,6 +1491,17 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
     struct domain_info_context *dinfo = &ctx->dinfo;
 
     DPRINTF("%s: starting restore of new domid %u", __func__, dom);
+
+    if ( lazy )
+    {
+        DPRINTF("xc: lazy switch enabled for restore\n");
+
+        if ( !hvm )
+        {
+            PERROR("xc: lazy restore called for non HVM guest");
+            return 1;
+        }
+    }
 
     pagebuf_init(&pagebuf);
     memset(&tailbuf, 0, sizeof(tailbuf));

@@ -167,6 +167,7 @@ struct cmd_spec cmd_table[] = {
       "Restore a domain from a saved state",
       "[options] [<ConfigFile>] <CheckpointFile>",
       "-h                       Print this help.\n"
+      "-l                       Enable lazy restore.\n"
       "-p                       Do not unpause domain after restoring it.\n"
       "-e                       Do not wait in the background for the death of the domain.\n"
       "-d                       Enable debug messages.\n"

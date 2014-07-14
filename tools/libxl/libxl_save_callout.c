@@ -59,7 +59,7 @@ void libxl__xc_domain_restore(libxl__egc *egc, libxl__domain_create_state *dcs,
         state->store_domid, state->console_port,
         state->console_domid,
         hvm, pae, superpages,
-        cbflags, dcs->checkpointed_stream,
+        cbflags, dcs->checkpointed_stream, dcs->lazy
     };
 
     dcs->shs.ao = ao;
