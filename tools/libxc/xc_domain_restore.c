@@ -39,13 +39,19 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <inttypes.h>
+#include <poll.h>
+#include <sys/wait.h>
 
 #include "xg_private.h"
 #include "xg_save_restore.h"
 #include "xc_dom.h"
+#include "xc_bitops.h"
+#include "hashtable.h"
 
 #include <xen/hvm/ioreq.h>
 #include <xen/hvm/params.h>
+#include <xen/event_channel.h>
+#include <xen/mem_event.h>
 
 struct restore_ctx {
     unsigned long max_mfn; /* max mfn of the current host machine */
@@ -58,11 +64,55 @@ struct restore_ctx {
     xen_pfn_t *p2m_saved_batch; /* Copy of p2m_batch array for pv superpage alloc */
     int superpages; /* Superpage allocation has been requested */
     int hvm;    /* This is an hvm domain */
+    int lazy;   /* To use lazy restore or not. */
     int completed; /* Set when a consistent image is available */
     int last_checkpoint; /* Set when we should commit to the current checkpoint when it completes. */
     int compressing; /* Set when sender signals that pages would be sent compressed (for Remus) */
     struct domain_info_context dinfo;
+    int pager_fallback; /* Set when lazy restore pager fails to setup and we fallback to normal restore.*/
 };
+
+struct mem_event {
+    domid_t domain_id;
+    xc_evtchn *xce_handle;
+    int port;
+    mem_event_back_ring_t back_ring;
+    uint32_t evtchn_port;
+    void *ring_page;
+};
+
+/* The domain-id of the new domain is written to the path at %u */
+#define XC_LAZY_RESTORE_PAGER_LOG_FILE "/var/log/xen/lazy_restore_pager_domain_%u"
+#define LAZY_RESTORE_PAGER_SUCCESS "setup-success"
+#define LAZY_RESTORE_PAGER_FAILURE "setup-failure"
+
+/*
+ * hash_from_key_fn and keys_equal_fn.
+ * functions used by hash function to hash pfn's.
+ * Copied directly from tools/xenstore/xenstore_code.h
+ * Currently no modification, Will modify later if required.
+ */
+static inline unsigned int hash_from_key_fn(void *k)
+{
+    char *str = k;
+    unsigned int hash = 5381;
+    char c;
+
+    while ((c = *str++))
+        hash = ((hash << 5) + hash) + (unsigned int)c;
+
+    return hash;
+}
+
+static inline int keys_equal_fn(void *key1, void *key2)
+{
+    return 0 == strcmp((char *)key1, (char *)key2);
+}
+
+/* Define the hashtable insert, search and remove functions. */
+DEFINE_HASHTABLE_INSERT_VALUE(hashtable_insert_pfn, uint64_t, off_t);
+DEFINE_HASHTABLE_REMOVE(hashtable_remove_pfn, uint64_t, off_t)
+DEFINE_HASHTABLE_SEARCH(hashtable_search_pfn, uint64_t, off_t)
 
 #define HEARTBEAT_MS 1000
 
@@ -718,7 +768,7 @@ struct toolstack_data_t {
 typedef struct {
     void* pages;
     /* pages is of length nr_physpages, pfn_types is of length nr_pages */
-    unsigned int nr_physpages, nr_pages;
+    unsigned int nr_physpages, nr_pages, total_pages;
 
     /* checkpoint compression state */
     int compressing;
@@ -726,6 +776,9 @@ typedef struct {
 
     /* Types of the pfns in the current region */
     unsigned long* pfn_types;
+
+    /*Hashtable storing pfn to fileoffset map for lazy restore.*/
+    struct hashtable *pfn_to_fileoffset;
 
     int verify;
 
@@ -767,6 +820,126 @@ static void pagebuf_free(pagebuf_t* buf)
         free(buf->pfn_types);
         buf->pfn_types = NULL;
     }
+    if(buf->pfn_to_fileoffset) {
+        /* Tell hashtable to free the values too. */
+        hashtable_destroy(buf->pfn_to_fileoffset,1);
+        buf->pfn_to_fileoffset = NULL;
+    }
+}
+
+/* Function to perform libxl callback */
+static inline int do_callback(xc_interface *xch, uint32_t dom,
+                       struct toolstack_data_t *tdata,
+                       struct restore_callbacks *callbacks)
+{
+    int rc = 0;
+    if ( tdata && tdata->data != NULL )
+    {
+        if ( callbacks != NULL && callbacks->toolstack_restore != NULL )
+        {
+            DPRINTF("Going to call callback function");
+            rc = callbacks->toolstack_restore(dom, tdata->data, tdata->len,
+                                               callbacks->data);
+            free(tdata->data);
+            if ( rc < 0 )
+                PERROR("error calling toolstack_restore");
+        }
+        else
+        {
+            rc = -1;
+            ERROR("toolstack data available but no callback provided\n");
+            free(tdata->data);
+        }
+    }
+    return rc;
+}
+
+static int nominate_and_evict_one(xc_interface *xch, uint32_t dom,
+                                  unsigned long _pfn)
+{
+    int rc;
+    unsigned long pfn = _pfn;
+
+    /* Nominate page */
+    rc = xc_mem_paging_nominate(xch, dom, pfn);
+    if ( rc < 0 )
+    {
+        /* unpageable gfn is indicated by EBUSY */
+        if ( errno == EBUSY )
+            rc = errno;
+        else
+        {
+            PERROR("Error nominating page %lx", pfn);
+            rc = -errno;
+        }
+        goto out;
+    }
+
+    /* Tell Xen to evict page */
+    rc = xc_mem_paging_evict(xch, dom, pfn);
+    if ( rc < 0 )
+    {
+        /* A gfn in use is indicated by EBUSY */
+        if ( errno == EBUSY )
+        {
+            DPRINTF("Nominated page %lx busy, How is this possible", pfn);
+        } else
+            PERROR("Error evicting page %lx", pfn);
+        rc = -errno;
+        goto out;
+    }
+
+    rc = 0;
+    out:
+        return rc;
+}
+
+static int nominate_and_evict(xc_interface *xch, struct restore_ctx *ctx,
+                              pagebuf_t* buf, tailbuf_t *tailbuf, uint32_t dom)
+{
+    int i, rc = 0;
+    unsigned long pfn;
+    uint32_t unpageable = 0;
+
+    for ( i=0; i<buf->total_pages; i++ )
+    {
+        pfn = buf->pfn_types[i] ;
+
+        if (pfn == tailbuf->u.hvm.magicpfns[0] ||
+            pfn == tailbuf->u.hvm.magicpfns[1] ||
+            pfn == tailbuf->u.hvm.magicpfns[2] )
+        {
+            DPRINTF("Skipping magic pfn %lx",pfn);
+            continue;
+        }
+
+        if (pfn == buf->console_pfn      ||
+            pfn == buf->paging_ring_pfn  ||
+            pfn == buf->access_ring_pfn  ||
+            pfn == buf->sharing_ring_pfn ||
+            pfn == buf->ioreq_server_pfn  )
+        {
+            DPRINTF("Skipping usual pfn %lx",pfn);
+            continue;
+        }
+
+        rc = nominate_and_evict_one(xch, dom, pfn);
+        if ( rc == EBUSY )
+        {
+            unpageable++;
+            continue;
+        }
+        if( rc < 0)
+        {
+            PERROR("Could not evict page %d, pfn - %lx",i,pfn);
+            goto out;
+        }
+    }
+    DPRINTF("restore-pager: nominate and evict pfn's done\n"
+            "\ttotal pages - %u and unpageable pages %u",buf->total_pages,unpageable);
+
+  out:
+    return rc;
 }
 
 static int pagebuf_get_one(xc_interface *xch, struct restore_ctx *ctx,
@@ -775,6 +948,7 @@ static int pagebuf_get_one(xc_interface *xch, struct restore_ctx *ctx,
     int count, countpages, oldcount, i;
     void* ptmp;
     unsigned long compbuf_size;
+    unsigned long  pagetype=0;
 
     if ( RDEXACT(fd, &count, sizeof(count)) )
     {
@@ -1041,11 +1215,59 @@ static int pagebuf_get_one(xc_interface *xch, struct restore_ctx *ctx,
         return -1;
     }
 
+    if ( ctx->lazy )
+    {
+        int pages_this_batch = 0;
+        off_t prev_offset=0, temp_offset=0, page_offset=0;
+
+        prev_offset = lseek(fd, 0, SEEK_CUR);
+        if ( prev_offset < 0 )
+        {
+            PERROR("ERROR problem reading file offset");
+            return -errno;
+        }
+
+        for (i = oldcount; i < buf->nr_pages; ++i)
+        {
+            pagetype = buf->pfn_types[i] & XEN_DOMCTL_PFINFO_LTAB_MASK;
+            if ( pagetype == XEN_DOMCTL_PFINFO_XTAB ||
+                 pagetype == XEN_DOMCTL_PFINFO_BROKEN ||
+                 pagetype == XEN_DOMCTL_PFINFO_XALLOC )
+            {
+                page_offset = (off_t)-1;
+            }
+            else
+            {
+                page_offset = prev_offset + pages_this_batch*PAGE_SIZE;
+                pages_this_batch++;
+            }
+
+            if( ! hashtable_insert_pfn(buf->pfn_to_fileoffset,
+                                       &buf->pfn_types[i],
+                                       page_offset))
+            {
+                PERROR("Error Inserting pfn (%llx) to hashtable, offset (%u)",
+                                        (long long unsigned)buf->pfn_types[i],
+                                        (unsigned) page_offset);
+                return -1;
+            }
+        }
+
+        /* Seek to the starting of the next chunk. */
+        temp_offset = prev_offset + pages_this_batch*PAGE_SIZE;
+        prev_offset = lseek(fd, temp_offset , SEEK_SET);
+        if ( prev_offset < 0 || prev_offset != temp_offset )
+        {
+            PERROR("ERROR problem while advancing file offset");
+            return -errno;
+        }
+
+        return count;
+    }
+
     countpages = count;
     for (i = oldcount; i < buf->nr_pages; ++i)
     {
-        unsigned long pagetype;
-
         pagetype = buf->pfn_types[i] & XEN_DOMCTL_PFINFO_LTAB_MASK;
         if ( pagetype == XEN_DOMCTL_PFINFO_XTAB ||
              pagetype == XEN_DOMCTL_PFINFO_BROKEN ||
@@ -1127,6 +1349,10 @@ static int apply_batch(xc_interface *xch, uint32_t dom, struct restore_ctx *ctx,
     j = pagebuf->nr_pages - curbatch;
     if (j > MAX_BATCH_SIZE)
         j = MAX_BATCH_SIZE;
+
+    /* If we reverted from lazy pager just apply pages */
+    if( ctx->pager_fallback )
+        goto lazy_pager_fallback;
 
     /* First pass for this batch: work out how much memory to alloc, and detect superpages */
     nr_mfns = scount = 0;
@@ -1246,6 +1472,17 @@ static int apply_batch(xc_interface *xch, uint32_t dom, struct restore_ctx *ctx,
         }
     }
 
+    if ( ctx->lazy )
+    {
+        /*
+         * If lazy restore we just allocate the pages in the first pass,
+         * the loading of actual pages is done by the pager when required.
+         */
+        rc = nraces ;
+        return rc;
+    }
+
+  lazy_pager_fallback:
     /* Second pass for this batch: update p2m[] and region_mfn[] */
     nr_mfns = 0; 
     for ( i = 0; i < j; i++ )
@@ -1426,6 +1663,564 @@ static int apply_batch(xc_interface *xch, uint32_t dom, struct restore_ctx *ctx,
     return rc;
 }
 
+/* Get mem event requests from shared ring. */
+static void get_request(struct mem_event *mem_event, mem_event_request_t *req)
+{
+    mem_event_back_ring_t *back_ring;
+    RING_IDX req_cons;
+
+    back_ring = &mem_event->back_ring;
+    req_cons = back_ring->req_cons;
+
+    /* Copy request */
+    memcpy(req, RING_GET_REQUEST(back_ring, req_cons), sizeof(*req));
+    req_cons++;
+
+    /* Update ring */
+    back_ring->req_cons = req_cons;
+    back_ring->sring->req_event = req_cons + 1;
+}
+
+/* Put mem event response onto shared ring. */
+static void put_response(struct mem_event *mem_event, mem_event_response_t *rsp)
+{
+    mem_event_back_ring_t *back_ring;
+    RING_IDX rsp_prod;
+
+    back_ring = &mem_event->back_ring;
+    rsp_prod = back_ring->rsp_prod_pvt;
+
+    /* Copy response */
+    memcpy(RING_GET_RESPONSE(back_ring, rsp_prod), rsp, sizeof(*rsp));
+    rsp_prod++;
+
+    /* Update ring */
+    back_ring->rsp_prod_pvt = rsp_prod;
+    RING_PUSH_RESPONSES(back_ring);
+}
+
+/* Read the page requested by pager and add the page to guest memory. */
+static int populate_page(xc_interface *xch,
+                         struct mem_event *mem_event,
+                         void *pager_buffer, unsigned long pfn,
+                         off_t off, int fd)
+{
+    int rc;
+    unsigned char oom = 0;
+    int read_bytes = 0;
+    int bytes;
+    off_t offset;
+
+    DPRINTF("populate_page < pfn %lx pageslot %d\n", pfn, (int) off);
+
+    /* Read page from saved image. */
+    offset = lseek(fd, off, SEEK_SET);
+    if ( offset < 0 || offset != off )
+    {
+        PERROR("Error seeking to starting of page.");
+        return -errno;
+    }
+
+    while ( read_bytes < PAGE_SIZE )
+    {
+        bytes = read(fd, pager_buffer + read_bytes, PAGE_SIZE - read_bytes);
+        if ( bytes <= 0 )
+        {
+            PERROR("Error seeking to starting of page.");
+            return -errno;
+        }
+        read_bytes += bytes;
+    }
+
+    do
+    {
+        /* Tell Xen to allocate a page for the domain */
+        rc = xc_mem_paging_load(xch, mem_event->domain_id, pfn, pager_buffer);
+        if ( rc < 0 )
+        {
+            if ( errno == ENOMEM )
+            {
+                /*
+                 * This is actually a temporary solution until we find a more
+                 * complete and reliable solution.
+                 */
+                if ( oom++ == 0 )
+                    DPRINTF("ENOMEM while preparing pfn %lx\n", pfn);
+                sleep(1);
+                continue;
+            }
+            PERROR("Error loading %lx during page-in", pfn);
+            rc = -errno;
+            break;
+        }
+    }
+    while (rc);
+
+    return rc;
+}
+
+#define PAGER_EVENT_RECEIVED        0
+#define PAGER_EVENT_TIMEOUT         1
+
+/*
+ * waits for an event from xen or timeout.
+ * Return semantics are -
+ * -errno for error.
+ * 0 for successful event.
+ * 1 for timeout.
+ * 2 for domain shutdown.
+ */
+static int wait_for_event_or_timeout(xc_interface *xch,
+                                     struct restore_ctx *ctx,
+                                     struct mem_event *mem_event)
+{
+    xc_evtchn *xce = mem_event->xce_handle;
+    struct pollfd fd;
+    int port;
+    int rc;
+    int timeout = 0;
+
+    /* Wait for event channel and xenstore */
+    fd.fd = xc_evtchn_fd(xce);
+    fd.events = POLLIN | POLLERR;
+
+    rc = poll(&fd, 1, timeout);
+    if ( rc < 0 )
+    {
+        if (errno == EINTR)
+            return PAGER_EVENT_TIMEOUT;
+
+        PERROR("Poll exited with an error");
+        return -errno;
+    }
+
+    if ( rc && fd.revents & POLLIN )
+    {
+        DPRINTF("Got event from evtchn\n");
+        port = xc_evtchn_pending(xce);
+        if ( port == -1 )
+        {
+            PERROR("Failed to read port from event channel");
+            rc = -errno;
+            goto err;
+        }
+        if ( port != mem_event->port )
+        {
+            PERROR("Event chanel port value mismatch");
+            rc = -errno;
+            goto err;
+        }
+
+        rc = xc_evtchn_unmask(xce, port);
+        if ( rc < 0 )
+        {
+            PERROR("Failed to unmask event channel port");
+            rc = -errno;
+            goto err;
+        }
+
+        rc = PAGER_EVENT_RECEIVED;
+    }
+    else
+        rc = PAGER_EVENT_TIMEOUT;
+
+    err:
+        return rc;
+}
+
+/*
+ * Setup the lazy restore pager to serve the pagein requests by opening
+ * connection to xenstore enabling mempaging, setting up a ring to
+ * communicate with xen for mem requests.
+ * The pager continuously looks for incoming paging requests and populates
+ * required pages to the guest memory by reading them from the save image.
+ * The pager writes its pid to xenstore at the path
+ *  /local/domain/0/restore-pager/$domain_id/pid -> $pid
+ * Returns -
+ * 0 on successful completion.
+ * 1 on setup failure.
+ * -errno on error after successful setup.
+ */
+static int lazy_restore_pager(xc_interface *xch, struct restore_ctx *ctx,
+                              pagebuf_t* buf, tailbuf_t *tailbuf, int fd,
+                              domid_t dom, int pipe_fd)
+{
+    int rc = -1, rc2;
+    off_t *off;
+    uint32_t max_pages;
+    unsigned long *bitmap = NULL;
+    void *pager_buffer = NULL;
+    struct mem_event _mem_event;
+    struct mem_event *mem_event = &_mem_event;
+    mem_event_request_t req;
+    mem_event_response_t rsp;
+    xc_domaininfo_t domain_info;
+    bool enabled_paging = false;
+
+    memset(mem_event, 0, sizeof(*mem_event));
+    mem_event->domain_id = dom;
+
+    DPRINTF("restore-pager: Inside lazy restore pager pid - %u",(unsigned)getpid());
+
+    /* Open event channel */
+    mem_event->xce_handle = xc_evtchn_open(NULL, 0);
+    if ( mem_event->xce_handle == NULL )
+    {
+        PERROR("restore-pager: Failed to open event channel");
+        goto out;
+    }
+
+    DPRINTF("restore-pager: Opened up xce event channel");
+
+    /* Allocate the paging buffer. */
+    errno = posix_memalign(&pager_buffer, PAGE_SIZE, PAGE_SIZE);
+    if ( errno != 0 )
+    {
+        PERROR("restore-pager: Error while aligning paging buffer to PAGE_SIZE");
+        goto out;
+    }
+
+    /* Lock buffer in memory so it can't be paged out */
+    if ( mlock(pager_buffer, PAGE_SIZE) < 0 )
+    {
+        PERROR("restore-pager: error locking paging buffer into memory.");
+        goto out;
+    }
+    DPRINTF("restore-pager: mem aligned and memlocked pager buffers");
+
+    /* Get max_pages from guest */
+    rc = xc_domain_getinfolist(xch, mem_event->domain_id, 1,
+                               &domain_info);
+    if ( rc != 1 )
+    {
+        PERROR("restore-pager: Error getting domain info");
+        rc = -1;
+        goto out;
+    }
+    max_pages = domain_info.max_pages;
+
+    DPRINTF("restore-pager: Got max pages from xen %u",max_pages);
+
+    /* Allocate bitmap for tracking pages that have been paged in */
+    bitmap = bitmap_alloc(max_pages);
+    if ( !bitmap )
+    {
+        PERROR("restore-pager: Error allocating bitmap");
+        rc = -1;
+        goto out;
+    }
+    DPRINTF("restore-pager: max_pages = %d\n", max_pages);
+
+    /* Initialize paging by setting up ring and event channel. */
+    rc = xc_mem_paging_ring_setup(xch, mem_event->xce_handle,
+                                  mem_event->domain_id,
+                                  mem_event->ring_page,
+                                  &mem_event->port,
+                                  &mem_event->evtchn_port,
+                                  &mem_event->back_ring);
+    if( rc < 0 )
+    {
+        PERROR("Could not initialize mem paging");
+        goto out;
+    }
+    DPRINTF("restore-pager: ring and event channel setup successful");
+    enabled_paging = true;
+
+    rc = nominate_and_evict(xch, ctx, buf, tailbuf, dom);
+    if ( rc < 0 )
+    {
+        PERROR("Error while nominating and evicting pfn's");
+        goto out;
+    }
+
+    /* Wakeup the parent process and close the pipe afterwards. */
+    rc = write(pipe_fd, LAZY_RESTORE_PAGER_SUCCESS,
+               strlen(LAZY_RESTORE_PAGER_FAILURE));
+    if( rc < 0 )
+    {
+        PERROR("Error while writing success status to pipe");
+        goto out;
+    }
+    rc = close(pipe_fd);
+    if( rc < 0 )
+        PERROR("Error closing pager end of pipe");
+
+    /* Start looping to check for incoming page-in requests. */
+    for ( ; ; )
+    {
+        if( hashtable_count(buf->pfn_to_fileoffset) == 0 )
+        {
+            DPRINTF("Hashtable count dropped to zero.");
+            rc = 0;
+            goto out;
+        }
+
+        rc = wait_for_event_or_timeout(xch, ctx, mem_event);
+        if( rc < 0 )
+        {
+            PERROR("Problem waiting for event");
+            goto out;
+        }
+        else if ( rc == PAGER_EVENT_TIMEOUT )
+        {
+            DPRINTF("Event poll timeout, policy not implemented");
+        }
+
+        while ( RING_HAS_UNCONSUMED_REQUESTS(&mem_event->back_ring) )
+        {
+            rc = -1;
+            get_request(mem_event, &req);
+
+            /* Check if the page has already been paged in */
+            if ( test_bit(req.gfn, bitmap) )
+            {
+                /* Find where in the paging file to read from */
+                off = hashtable_search_pfn( buf->pfn_to_fileoffset, &req.gfn );
+                if( off == NULL )
+                {
+                    PERROR("Error page %"PRIx64" not found", req.gfn);
+                    goto out;
+                }
+
+                if ( req.flags & MEM_EVENT_FLAG_DROP_PAGE )
+                {
+                    DPRINTF("drop_page ^ gfn %"PRIx64"", req.gfn);
+                }
+                else
+                {
+                    /* Populate the page */
+                    rc = populate_page(xch, mem_event, pager_buffer,
+                                       req.gfn, *off, fd);
+                    if ( rc < 0 )
+                    {
+                        ERROR("Error populating page %"PRIx64"", req.gfn);
+                        goto out;
+                    }
+                }
+                /* Clear the bit for both dropped pages and populated pages */
+                clear_bit(req.gfn, bitmap);
+
+                /* Remove the entry from hashtable. */
+                off = hashtable_remove_pfn( buf->pfn_to_fileoffset, &req.gfn );
+                if( off == NULL )
+                {
+                    PERROR("Error removing page %"PRIx64" from hashtable",
+                                                                 req.gfn);
+                    goto out;
+                }
+                free(off);
+
+                /* Prepare the response */
+                rsp.gfn = req.gfn;
+                rsp.vcpu_id = req.vcpu_id;
+                rsp.flags = req.flags;
+
+                /* Put the page info on the ring */
+                put_response(mem_event, &rsp);
+                rc = xc_evtchn_notify(mem_event->xce_handle,
+                                      mem_event->port);
+                if ( rc < 0 )
+                {
+                    PERROR("Error notifying event for page %"PRIx64"", req.gfn);
+                    goto out;
+                }
+            }
+            else
+            {
+                /* Search for pfn to look for potential duplicates. */
+                off = hashtable_search_pfn( buf->pfn_to_fileoffset, &req.gfn );
+                if( off != NULL )
+                {
+                    PERROR("Error duplicate page %"PRIx64" found in hashtable",
+                                                                      req.gfn);
+                    goto out;
+                }
+
+                DPRINTF("page %s populated (domain = %d; vcpu = %d;"
+                        " gfn = %"PRIx64"; paused = %d; evict_fail = %d)",
+                        req.flags & MEM_EVENT_FLAG_EVICT_FAIL ? "not" : "already",
+                        mem_event->domain_id, req.vcpu_id, req.gfn,
+                        !!(req.flags & MEM_EVENT_FLAG_VCPU_PAUSED) ,
+                        !!(req.flags & MEM_EVENT_FLAG_EVICT_FAIL) );
+
+                /* Tell Xen to resume the vcpu */
+                if (( req.flags & MEM_EVENT_FLAG_VCPU_PAUSED ) ||
+                    ( req.flags & MEM_EVENT_FLAG_EVICT_FAIL  ))
+                {
+                    /* Prepare the response */
+                    rsp.gfn = req.gfn;
+                    rsp.vcpu_id = req.vcpu_id;
+                    rsp.flags = req.flags;
+
+                    /* Put the page info on the ring */
+                    put_response(mem_event, &rsp);
+                    rc = xc_evtchn_notify(mem_event->xce_handle,
+                                          mem_event->port);
+                    if ( rc < 0 )
+                    {
+                        PERROR("Error resuming page %"PRIx64"", req.gfn);
+                        goto out;
+                    }
+                }
+            }
+        }
+    }
+
+  out:
+    if( mem_event )
+    {
+        if( enabled_paging )
+        {
+            /* Tear down domain paging and ring setup in Xen */
+            rc2 = xc_mem_paging_ring_teardown(xch, mem_event->xce_handle,
+                                             mem_event->domain_id,
+                                             mem_event->ring_page,
+                                             &mem_event->port);
+            if ( rc2 < 0 )
+                PERROR("Error in mem paging teardown");
+            else
+                DPRINTF("tear down ring and mempaging successful");
+        }
+        if( mem_event->xce_handle )
+        {
+            /* Close event channel */
+            rc2 = xc_evtchn_close(mem_event->xce_handle);
+            if ( rc2 != 0 )
+                PERROR("Error closing event channel");
+        }
+    }
+    if( pager_buffer )
+    {
+        /* unlock buffer from memory */
+        if ( munlock(pager_buffer, PAGE_SIZE) < 0 )
+            PERROR("error locking paging buffer into memory.");
+    }
+    if ( !enabled_paging ) /* Error received during setup */
+        rc = 1;
+
+    free(bitmap);
+    free(pager_buffer);
+
+    if ( rc < 0 )
+        rc = -errno;
+
+    return rc;
+}
+
+/* Start the lazy restore pager daemon */
+static void lazy_restore_pager_daemon(xc_interface *xch,
+                                     struct restore_ctx *ctx,
+                                     pagebuf_t* buf, tailbuf_t *tailbuf,
+                                     int io_fd, domid_t dom, int *pipe_c2p)
+{
+    int rc, i;
+    pid_t sid;
+    FILE *log_file = NULL;
+    char log_path[80];
+    xentoollog_logger *dbg = NULL;
+    bool wakeup_parent = true;
+
+    /* Pager needs to send message to parent so close read end. */
+    close(pipe_c2p[0]);
+
+    /* Change the working directory to root. */
+    if( chdir("/") < 0 )
+    {
+        PERROR("restore pager: chdir failed");
+    }
+
+    /* Create a new session id*/
+    sid = setsid();
+    if( sid == (pid_t)-1 )
+    {
+        PERROR("restore pager: setsid failed");
+    }
+
+    /* Set the umask to 077, so that no one can read/write our data.*/
+    umask(077);
+
+    sprintf(log_path, XC_LAZY_RESTORE_PAGER_LOG_FILE, dom);
+    DPRINTF("restore-pager: logging to log file %s\n",log_path);
+
+    /* Close connection to Xen so that we can open new log */
+    rc = xc_interface_close(xch);
+    if ( rc != 0 )
+    {
+        ERROR("Error closing connection to xen");
+        xch = NULL;
+        goto err;
+    }
+
+    /* Close the unnecessary file descriptors. */
+    for ( i=0; i<1024; i++ )
+    {
+        if( i == io_fd || i == pipe_c2p[1] )
+            continue;
+        close(i);
+    }
+
+    log_file = fopen(log_path, "w");
+    if ( !log_file )
+    {
+        ERROR("restore pager: error opening log file");
+        goto err;
+    }
+    dbg = (xentoollog_logger *)xtl_createlogger_stdiostream(log_file, XTL_DEBUG, 0);
+
+    /* Open connection to xen */
+    xch = xc_interface_open(dbg, NULL, 0);
+    if ( !xch )
+    {
+        ERROR("restore pager: error opening connection to xen");
+        goto err;
+    }
+
+    DPRINTF("Opened up connection to xen with new log.\n");
+
+    /* start lazy restore pager */
+    rc = lazy_restore_pager(xch, ctx, buf, tailbuf,
+                            io_fd, dom, pipe_c2p[1]);
+    if ( rc == 1 )
+    {
+        PERROR("restore-pager: Error during lazy restore pager setup");
+        goto err;
+    }
+
+    DPRINTF("restore-pager: pager exit of domid %u with rc=%d", dom, rc);
+    wakeup_parent = false; /*Success, We don't need to wakeup parent */
+
+  err:
+    if ( wakeup_parent )
+    {
+        rc = write(pipe_c2p[1], LAZY_RESTORE_PAGER_FAILURE,
+                    strlen(LAZY_RESTORE_PAGER_FAILURE));
+        if( rc < 0 )
+            ERROR("restore-pager: Error while writing setup failed status to pipe");
+        rc = close(pipe_c2p[1]);
+        if( rc < 0 )
+            ERROR("restore-pager: Error closing pager end of pipe");
+        rc = 1;
+        goto out;
+    }
+    if ( xch )
+    {
+        /* Close connection to Xen. */
+        rc = xc_interface_close(xch);
+        if ( rc != 0 )
+        {
+            ERROR("restore-pager: Error closing connection to xen");
+            rc = 1;
+        }
+    }
+    if ( log_file )
+        rc = fclose(log_file);
+
+    rc = 0;
+
+  out:
+    exit(rc);
+}
+
 int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
                       unsigned int store_evtchn, unsigned long *store_mfn,
                       domid_t store_domid, unsigned int console_evtchn,
@@ -1440,6 +2235,7 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
     uint32_t vcpuextstate_size = 0;
     unsigned long mfn, pfn;
     int nraces = 0;
+    off_t saved_offset = 0;
 
     /* The new domain's shared-info frame number. */
     unsigned long shared_info_frame;
@@ -1492,17 +2288,6 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
 
     DPRINTF("%s: starting restore of new domid %u", __func__, dom);
 
-    if ( lazy )
-    {
-        DPRINTF("xc: lazy switch enabled for restore\n");
-
-        if ( !hvm )
-        {
-            PERROR("xc: lazy restore called for non HVM guest");
-            return 1;
-        }
-    }
-
     pagebuf_init(&pagebuf);
     memset(&tailbuf, 0, sizeof(tailbuf));
     tailbuf.ishvm = hvm;
@@ -1513,6 +2298,7 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
     ctx->superpages = superpages;
     ctx->hvm = hvm;
     ctx->last_checkpoint = !checkpointed_stream;
+    ctx->lazy = lazy;
 
     ctxt = xc_hypercall_buffer_alloc(xch, ctxt, sizeof(*ctxt));
 
@@ -1521,7 +2307,6 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
         PERROR("Unable to allocate VCPU ctxt buffer");
         return 1;
     }
-
 
     if ( (orig_io_fd_flags = fcntl(io_fd, F_GETFL, 0)) < 0 ) {
         PERROR("unable to read IO FD flags");
@@ -1621,19 +2406,50 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
         goto out;
     }
 
-    xc_report_progress_start(xch, "Reloading memory pages", dinfo->p2m_size);
+    if ( ctx->lazy )
+    {
+        DPRINTF("lazy switch enabled for restore\n");
+        if ( !hvm )
+        {
+            DPRINTF("lazy restore should be called only for HVM guests\n"
+                    "reverting to non lazy restore");
+            ctx->lazy = 0;
+            goto loadpages;
+        }
 
+        saved_offset = lseek(io_fd, 0, SEEK_CUR);
+        if ( saved_offset < 0 )
+        {
+            PERROR("ERROR problem saving file offset");
+            ctx->lazy = 0;
+            goto loadpages;
+        }
+
+        pagebuf.pfn_to_fileoffset = create_hashtable(16, hash_from_key_fn,
+                                                     keys_equal_fn);
+        if ( !pagebuf.pfn_to_fileoffset )
+        {
+            PERROR("ERROR problem creating hashtable for lazy restore.");
+            ctx->lazy = 0;
+        }
+    }
+
+ loadpages:
+    if ( !ctx->lazy )
+        xc_report_progress_start(xch, "Reloading memory pages",
+                                 dinfo->p2m_size);
+    else
+        xc_report_progress_start(xch, "Reading page offsets form file",
+                                 dinfo->p2m_size);
     /*
      * Now simply read each saved frame into its new machine frame.
      * We uncanonicalise page tables as we go.
      */
 
     n = m = 0;
- loadpages:
     for ( ; ; )
     {
         int j, curbatch;
-
         xc_report_progress_step(xch, n, dinfo->p2m_size);
 
         if ( !ctx->completed ) {
@@ -1645,8 +2461,11 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
             }
         }
         j = pagebuf.nr_pages;
+        pagebuf.total_pages += j;
 
-        DBGPRINTF("batch %d\n",j);
+        /* Meaningful only for non lazy restore. */
+        if ( !ctx->lazy && !ctx->pager_fallback )
+            DBGPRINTF("batch %d\n",j);
 
         if ( j == 0 ) {
             /* catch vcpu updates */
@@ -2271,25 +3090,6 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
     goto out;
 
   finish_hvm:
-    if ( tdata.data != NULL )
-    {
-        if ( callbacks != NULL && callbacks->toolstack_restore != NULL )
-        {
-            frc = callbacks->toolstack_restore(dom, tdata.data, tdata.len,
-                                               callbacks->data);
-            free(tdata.data);
-            if ( frc < 0 )
-            {
-                PERROR("error calling toolstack_restore");
-                goto out;
-            }
-        } else {
-            rc = -1;
-            ERROR("toolstack data available but no callback provided\n");
-            free(tdata.data);
-            goto out;
-        }
-    }
 
     /* Dump the QEMU state to a state file for QEMU to load */
     if ( dump_qemu(xch, dom, &tailbuf.u.hvm) ) {
@@ -2352,12 +3152,163 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
         goto out;
     }
 
+    if ( ctx->lazy )
+    {
+        /*
+         * Start a pager here. We double fork to create a daemon pager
+         * to serve the pagefault requests of the lazy restore pager.
+         */
+        pid_t pid1, pid2;
+        int status;
+        int pipe_c2p[2] = { 0,0 }; /* pipe child to parent. */
+
+        /*
+         * set rc <0 so that if we get any error than we revert back
+         * to the conventional restore process by jumping to pager_out.
+         */
+        rc = -1;
+
+        if ( pipe(pipe_c2p) == -1 )
+        {
+            PERROR("Error setting up pager pipes");
+            goto pager_out;
+        }
+
+        pid1 = fork();
+        if( pid1 )
+        {
+            char buf[80];
+            int exit_code = 1;
+            memset(buf, 0, sizeof(buf));
+
+            /* Wait for the first child to exit. */
+            waitpid(pid1, &status, 0);
+            if ( WIFEXITED(status) )
+            {
+                exit_code = WEXITSTATUS(status);
+                DPRINTF("restore pager first child exited,"
+                        " status=%d\n", exit_code);
+            }
+            if ( exit_code != 0 )
+            {
+                PERROR("restore pager first child exited with error");
+                goto pager_out;
+            }
+
+            /* We only need to listen from child so close write end of pipe. */
+            close( pipe_c2p[1] );
+
+            /* Wait for the pager (grand child) to give us sign to continue */
+            rc = read(pipe_c2p[0], buf, sizeof(buf)); /* Blocking Call */
+            if( rc < 0 )
+            {
+                PERROR("Error while reading child status from pipe");
+            }
+            else if( strncmp(LAZY_RESTORE_PAGER_SUCCESS, buf,
+                             strlen(LAZY_RESTORE_PAGER_SUCCESS)) == 0 )
+            {
+                DPRINTF("Pager setup successful");
+            }
+            else if( strncmp(LAZY_RESTORE_PAGER_FAILURE, buf,
+                             strlen(LAZY_RESTORE_PAGER_FAILURE)) == 0 )
+            {
+                PERROR("Pager setup failed. "
+                       "Please check pager logs for details");
+                rc = -1; /* Set rc<0 so we can fallback to normal restore */
+                goto pager_out;
+            }
+            DPRINTF("Read %s from the pager rc is %d",buf,rc);
+
+            /* close the other end (read) of pipe too. */
+            close ( pipe_c2p[0] );
+            goto out;
+        }
+        else if ( pid1 == 0 ) /* first child process */
+        {
+            pid2 = fork();
+            if( pid2 )
+            {
+                exit(0);
+            }
+            else if ( pid2 == 0 ) /* second child process */
+            {
+                lazy_restore_pager_daemon(xch, ctx, &pagebuf,
+                                          &tailbuf, io_fd, dom, pipe_c2p);
+            }
+            else
+            {
+                /*
+                 * Failed to double fork while setting up the pager process,
+                 * exit the child process with failed status to notify the
+                 * parent process to revert back to normal restore process.
+                 */
+                PERROR("doublefork failed while setting up pager");
+                exit(1);
+            }
+        }
+        else
+        {
+            /* Lazy restore pager process fork failed, revert back. */
+            PERROR("fork failed while setting up pager");
+            goto pager_out;
+        }
+    }
+
     /* HVM success! */
     rc = 0;
+
+  pager_out:
+    if ( ctx->lazy ) /* Just in case we don't fall here from any other path. */
+    {
+        /*
+         * If we get some error while setting up the lazy restore pager
+         * than we cleanup the lazy pager data and try to restore the
+         * domain using non lazy approach.
+         */
+
+        /* Clear the hashtable */
+        if( pagebuf.pfn_to_fileoffset )
+        {
+            /* Tell the hashtable to free memory, so we pass second arg 1.*/
+            hashtable_destroy(pagebuf.pfn_to_fileoffset,1);
+            pagebuf.pfn_to_fileoffset = NULL;
+        }
+
+        if ( rc < 0 )
+        {
+            /*
+             * Error. Clear the lazy flag and revert back
+             * to continue with normal restore.
+             */
+            PERROR("Creation of restore pager failed."
+                   " Revert back to normal restore process");
+            ctx->lazy = 0;
+            ctx->completed = 0;
+            ctx->pager_fallback = 1;
+
+            if ( saved_offset )
+            {
+                off_t temp_offset;
+
+                temp_offset = lseek(io_fd, saved_offset , SEEK_SET);
+                if ( temp_offset < 0 || temp_offset != saved_offset )
+                {
+                    PERROR("ERROR problem while restoring file offset");
+                    rc = -1;
+                    goto out;
+                }
+            }
+            goto loadpages;
+        }
+    }
 
  out:
     if ( (rc != 0) && (dom != 0) )
         xc_domain_destroy(xch, dom);
+
+    /* Perform libxl callback before exiting. */
+    rc = do_callback(xch, dom, &tdata, callbacks);
+
     xc_hypercall_buffer_free(xch, ctxt);
     free(mmu);
     free(ctx->p2m);
@@ -2376,6 +3327,7 @@ int xc_domain_restore(xc_interface *xch, int io_fd, uint32_t dom,
 
     return rc;
 }
+
 /*
  * Local variables:
  * mode: C
