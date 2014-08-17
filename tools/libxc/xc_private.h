@@ -387,4 +387,12 @@ int xc_mem_event_enable(xc_interface *xch, domid_t domain_id, int param,
                         uint32_t *port, void *ring_page,
                         mem_event_back_ring_t *back_ring);
 
+/*
+ * Teardown mem_event
+ * returns 0 on success, if failure returns -errno with errno properly set.
+ * param can be HVM_PARAM_PAGING/ACCESS/SHARING_RING_PFN
+ */
+int xc_mem_event_teardown(xc_interface *xch, domid_t domain_id,
+                          int param, void *ring_page);
+
 #endif /* __XC_PRIVATE_H__ */

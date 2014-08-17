@@ -170,13 +170,11 @@ int xenaccess_teardown(xc_interface *xch, xenaccess_t *xenaccess)
         return 0;
 
     /* Tear down domain xenaccess in Xen */
-    if ( xenaccess->mem_event.ring_page )
-        munmap(xenaccess->mem_event.ring_page, XC_PAGE_SIZE);
-
     if ( mem_access_enable )
     {
         rc = xc_mem_access_disable(xenaccess->xc_handle,
-                                   xenaccess->mem_event.domain_id);
+                                   xenaccess->mem_event.domain_id,
+                                   xenaccess->mem_event.ring_page);
         if ( rc != 0 )
         {
             ERROR("Error tearing down domain xenaccess in xen");

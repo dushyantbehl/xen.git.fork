@@ -196,3 +196,62 @@ int xc_mem_event_enable(xc_interface *xch, domid_t domain_id, int param,
 
     return rc1;
 }
+
+/*
+ * Teardown mem_event
+ * returns 0 on success, if failure returns -errno with errno properly set.
+ * param can be HVM_PARAM_PAGING/ACCESS/SHARING_RING_PFN
+ */
+int xc_mem_event_teardown(xc_interface *xch, domid_t domain_id,
+                          int param, void *ring_page)
+{
+    int rc;
+    unsigned int op, mode;
+
+    switch ( param )
+    {
+        case HVM_PARAM_PAGING_RING_PFN:
+            op = XEN_DOMCTL_MEM_EVENT_OP_PAGING_DISABLE;
+            mode = XEN_DOMCTL_MEM_EVENT_OP_PAGING;
+            break;
+
+        case HVM_PARAM_ACCESS_RING_PFN:
+            op = XEN_DOMCTL_MEM_EVENT_OP_ACCESS_DISABLE;
+            mode = XEN_DOMCTL_MEM_EVENT_OP_ACCESS;
+            break;
+
+        case HVM_PARAM_SHARING_RING_PFN:
+            op = XEN_DOMCTL_MEM_EVENT_OP_SHARING_DISABLE;
+            mode = XEN_DOMCTL_MEM_EVENT_OP_SHARING;
+            break;
+
+        /*
+         * This is for the outside chance that the HVM_PARAM is valid but is invalid
+         * as far as mem_event goes.
+         */
+        default:
+            errno = EINVAL;
+            rc = -1;
+            goto out;
+    }
+
+    /* Remove the ring page. */
+    rc = munmap(ring_page, PAGE_SIZE);
+    if ( rc < 0 )
+        PERROR("Error while disabling paging in xen");
+
+    ring_page = NULL;
+
+    rc = xc_mem_event_control(xch, domain_id, op, mode, NULL);
+    if ( rc != 0 )
+    {
+        PERROR("Failed to disable mem_event\n");
+        goto out;
+    }
+
+  out:
+    if (rc != 0)
+        rc = -errno;
+
+    return rc;
+}

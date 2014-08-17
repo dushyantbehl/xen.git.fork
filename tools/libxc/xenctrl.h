@@ -2261,12 +2261,11 @@ int xc_mem_paging_load(xc_interface *xch, domid_t domain_id,
 /*
  * Enables mem_access and sets arg ring page equal to mapped page.
  * Will return 0 on success and -errno on error.
- * Caller has to unmap this page when done.
  */
 int xc_mem_access_enable(xc_interface *xch, domid_t domain_id,
                          uint32_t *port, void *ring_page,
                          mem_event_back_ring_t *back_ring);
-int xc_mem_access_disable(xc_interface *xch, domid_t domain_id);
+int xc_mem_access_disable(xc_interface *xch, domid_t domain_id, void *ring_page);
 int xc_mem_access_resume(xc_interface *xch, domid_t domain_id);
 
 /*

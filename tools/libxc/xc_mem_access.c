@@ -33,12 +33,11 @@ int xc_mem_access_enable(xc_interface *xch, domid_t domain_id,
                                port, ring_page, back_ring);
 }
 
-int xc_mem_access_disable(xc_interface *xch, domid_t domain_id)
+int xc_mem_access_disable(xc_interface *xch, domid_t domain_id, void *ring_page)
 {
-    return xc_mem_event_control(xch, domain_id,
-                                XEN_DOMCTL_MEM_EVENT_OP_ACCESS_DISABLE,
-                                XEN_DOMCTL_MEM_EVENT_OP_ACCESS,
-                                NULL);
+    return xc_mem_event_teardown(xch, domain_id,
+                                HVM_PARAM_ACCESS_RING_PFN,
+                                ring_page);
 }
 
 int xc_mem_access_resume(xc_interface *xch, domid_t domain_id)
