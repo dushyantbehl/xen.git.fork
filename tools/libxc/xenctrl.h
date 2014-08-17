@@ -2244,8 +2244,18 @@ int xc_tmem_restore_extra(xc_interface *xch, int dom, int fd);
  * Hardware-Assisted Paging (i.e. Intel EPT, AMD NPT). Moreover, AMD NPT
  * support is considered experimental.
  */
-int xc_mem_paging_enable(xc_interface *xch, domid_t domain_id, uint32_t *port);
-int xc_mem_paging_disable(xc_interface *xch, domid_t domain_id);
+/*
+ * Enables mem_paging and sets arg ring page equal to mapped page.
+ * returns 0 on success and -errno on error.
+ */
+int xc_mem_paging_enable(xc_interface *xch, domid_t domain_id,
+                         uint32_t *port,  void *ring_page,
+                         mem_event_back_ring_t *back_ring);
+/*
+ * Disables mem_paging and unmaps ring page.
+ * returns 0 on success and -errno on error.
+ */
+int xc_mem_paging_disable(xc_interface *xch, domid_t domain_id, void *ring_page);
 int xc_mem_paging_nominate(xc_interface *xch, domid_t domain_id,
                            unsigned long gfn);
 int xc_mem_paging_evict(xc_interface *xch, domid_t domain_id, unsigned long gfn);

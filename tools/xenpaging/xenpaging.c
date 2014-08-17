@@ -337,40 +337,12 @@ static struct xenpaging *xenpaging_init(int argc, char *argv[])
         PERROR("Could not bind to xenpaging watch\n");
         goto err;
     }
-
-    /* Map the ring page */
-    xc_get_hvm_param(xch, paging->mem_event.domain_id, 
-                        HVM_PARAM_PAGING_RING_PFN, &ring_pfn);
-    mmap_pfn = ring_pfn;
-    paging->mem_event.ring_page = 
-        xc_map_foreign_batch(xch, paging->mem_event.domain_id, 
-                                PROT_READ | PROT_WRITE, &mmap_pfn, 1);
-    if ( mmap_pfn & XEN_DOMCTL_PFINFO_XTAB )
-    {
-        /* Map failed, populate ring page */
-        rc = xc_domain_populate_physmap_exact(paging->xc_handle, 
-                                              paging->mem_event.domain_id,
-                                              1, 0, 0, &ring_pfn);
-        if ( rc != 0 )
-        {
-            PERROR("Failed to populate ring gfn\n");
-            goto err;
-        }
-
-        mmap_pfn = ring_pfn;
-        paging->mem_event.ring_page = 
-            xc_map_foreign_batch(xch, paging->mem_event.domain_id, 
-                                    PROT_READ | PROT_WRITE, &mmap_pfn, 1);
-        if ( mmap_pfn & XEN_DOMCTL_PFINFO_XTAB )
-        {
-            PERROR("Could not map the ring page\n");
-            goto err;
-        }
-    }
     
-    /* Initialise Xen */
+    /* Enable mem paging and initialize shared ring to communicate with xen. */
     rc = xc_mem_paging_enable(xch, paging->mem_event.domain_id,
-                             &paging->mem_event.evtchn_port);
+                              &paging->mem_event.evtchn_port,
+                              paging->mem_event.ring_page,
+                              &paging->mem_event.back_ring);
     if ( rc != 0 )
     {
         switch ( errno ) {
@@ -412,17 +384,6 @@ static struct xenpaging *xenpaging_init(int argc, char *argv[])
     }
 
     paging->mem_event.port = rc;
-
-    /* Initialise ring */
-    SHARED_RING_INIT((mem_event_sring_t *)paging->mem_event.ring_page);
-    BACK_RING_INIT(&paging->mem_event.back_ring,
-                   (mem_event_sring_t *)paging->mem_event.ring_page,
-                   PAGE_SIZE);
-
-    /* Now that the ring is set, remove it from the guest's physmap */
-    if ( xc_domain_decrease_reservation_exact(xch, 
-                    paging->mem_event.domain_id, 1, 0, &ring_pfn) )
-        PERROR("Failed to remove ring from guest physmap");
 
     /* Get max_pages from guest if not provided via cmdline */
     if ( !paging->max_pages )
@@ -523,9 +484,10 @@ static void xenpaging_teardown(struct xenpaging *paging)
     xs_unwatch(paging->xs_handle, "@releaseDomain", watch_token);
 
     paging->xc_handle = NULL;
+
     /* Tear down domain paging in Xen */
-    munmap(paging->mem_event.ring_page, PAGE_SIZE);
-    rc = xc_mem_paging_disable(xch, paging->mem_event.domain_id);
+    rc = xc_mem_paging_disable(xch, paging->mem_event.domain_id,
+                               paging->mem_event.ring_page);
     if ( rc != 0 )
     {
         PERROR("Error tearing down domain paging in xen");

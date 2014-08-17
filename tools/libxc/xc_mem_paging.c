@@ -23,28 +23,28 @@
 
 #include "xc_private.h"
 
-
+/*
+ * Enables mem_paging and sets arg ring page equal to mapped page.
+ * Will return 0 on success and -errno on error.
+ */
 int xc_mem_paging_enable(xc_interface *xch, domid_t domain_id,
-                         uint32_t *port)
+                         uint32_t *port,  void *ring_page,
+                         mem_event_back_ring_t *back_ring)
 {
-    if ( !port )
-    {
-        errno = EINVAL;
-        return -1;
-    }
-        
-    return xc_mem_event_control(xch, domain_id,
-                                XEN_DOMCTL_MEM_EVENT_OP_PAGING_ENABLE,
-                                XEN_DOMCTL_MEM_EVENT_OP_PAGING,
-                                port);
+    return xc_mem_event_enable(xch, domain_id,
+                               HVM_PARAM_PAGING_RING_PFN,
+                               port, ring_page, back_ring);
 }
 
-int xc_mem_paging_disable(xc_interface *xch, domid_t domain_id)
+/*
+ * Disable mem_paging and unmap ring page.
+ * Will return 0 on success and -errno on error.
+ */
+int xc_mem_paging_disable(xc_interface *xch, domid_t domain_id, void *ring_page)
 {
-    return xc_mem_event_control(xch, domain_id,
-                                XEN_DOMCTL_MEM_EVENT_OP_PAGING_DISABLE,
-                                XEN_DOMCTL_MEM_EVENT_OP_PAGING,
-                                NULL);
+    return xc_mem_event_teardown(xch, domain_id,
+                                 HVM_PARAM_ACCESS_RING_PFN,
+                                 ring_page);
 }
 
 int xc_mem_paging_nominate(xc_interface *xch, domid_t domain_id, unsigned long gfn)
