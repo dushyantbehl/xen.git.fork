@@ -22,6 +22,7 @@
  */
 
 #include "xc_private.h"
+#include <xen/mem_event.h>
 
 int xc_mem_event_control(xc_interface *xch, domid_t domain_id, unsigned int op,
                          unsigned int mode, uint32_t *port)
@@ -56,19 +57,27 @@ int xc_mem_event_memop(xc_interface *xch, domid_t domain_id,
     return do_memory_op(xch, mode, &meo, sizeof(meo));
 }
 
-void *xc_mem_event_enable(xc_interface *xch, domid_t domain_id, int param,
-                          uint32_t *port)
+/*
+ * Enables mem_event and initializes shared ring to communicate with hypervisor
+ * returns 0 if success and if failure returns -errno with
+ * errno properly set to indicate possible error.
+ * param can be HVM_PARAM_PAGING/ACCESS/SHARING_RING_PFN
+ */
+int xc_mem_event_enable(xc_interface *xch, domid_t domain_id, int param,
+                        uint32_t *port, void *ring_page,
+                        mem_event_back_ring_t *back_ring)
 {
-    void *ring_page = NULL;
     uint64_t pfn;
     xen_pfn_t ring_pfn, mmap_pfn;
     unsigned int op, mode;
-    int rc1, rc2, saved_errno;
+    int rc1, rc2, saved_errno, err;
+
+    ring_page = NULL;
 
     if ( !port )
     {
         errno = EINVAL;
-        return NULL;
+        return -errno;
     }
 
     /* Pause the domain for ring page setup */
@@ -76,7 +85,7 @@ void *xc_mem_event_enable(xc_interface *xch, domid_t domain_id, int param,
     if ( rc1 != 0 )
     {
         PERROR("Unable to pause domain\n");
-        return NULL;
+        return -errno;
     }
 
     /* Get the pfn of the ring page */
@@ -89,9 +98,9 @@ void *xc_mem_event_enable(xc_interface *xch, domid_t domain_id, int param,
 
     ring_pfn = pfn;
     mmap_pfn = pfn;
-    ring_page = xc_map_foreign_batch(xch, domain_id, PROT_READ | PROT_WRITE,
-                                     &mmap_pfn, 1);
-    if ( mmap_pfn & XEN_DOMCTL_PFINFO_XTAB )
+    ring_page = xc_map_foreign_bulk(xch, domain_id,
+                                    PROT_READ | PROT_WRITE, &mmap_pfn, &err, 1);
+    if ( (err != 0) || (ring_page == NULL) )
     {
         /* Map failed, populate ring page */
         rc1 = xc_domain_populate_physmap_exact(xch, domain_id, 1, 0, 0,
@@ -103,14 +112,22 @@ void *xc_mem_event_enable(xc_interface *xch, domid_t domain_id, int param,
         }
 
         mmap_pfn = ring_pfn;
-        ring_page = xc_map_foreign_batch(xch, domain_id, PROT_READ | PROT_WRITE,
-                                         &mmap_pfn, 1);
-        if ( mmap_pfn & XEN_DOMCTL_PFINFO_XTAB )
+        ring_page = xc_map_foreign_bulk(xch, domain_id, PROT_READ | PROT_WRITE,
+                                        &mmap_pfn, &err, 1);
+        if ( (err != 0) || (ring_page == NULL) )
         {
             PERROR("Could not map the ring page\n");
+            rc1 = -1;
             goto out;
         }
     }
+
+    /* Clear the ring page */
+    memset(ring_page, 0, PAGE_SIZE);
+
+    /* Initialise ring */
+    SHARED_RING_INIT((mem_event_sring_t *)ring_page);
+    BACK_RING_INIT(back_ring, (mem_event_sring_t *)ring_page, PAGE_SIZE);
 
     switch ( param )
     {
@@ -149,7 +166,12 @@ void *xc_mem_event_enable(xc_interface *xch, domid_t domain_id, int param,
     /* Remove the ring_pfn from the guest's physmap */
     rc1 = xc_domain_decrease_reservation_exact(xch, domain_id, 1, 0, &ring_pfn);
     if ( rc1 != 0 )
+    {
         PERROR("Failed to remove ring page from guest physmap");
+        goto out;
+    }
+
+    rc1 = 0;
 
  out:
     saved_errno = errno;
@@ -169,7 +191,8 @@ void *xc_mem_event_enable(xc_interface *xch, domid_t domain_id, int param,
         ring_page = NULL;
 
         errno = saved_errno;
+        rc1 = -errno;
     }
 
-    return ring_page;
+    return rc1;
 }

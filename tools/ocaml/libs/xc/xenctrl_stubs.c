@@ -526,12 +526,12 @@ CAMLprim value stub_xc_evtchn_reset(value xch, value domid)
 }
 
 
-#define RING_SIZE 32768
-static char ring[RING_SIZE];
+#define BUF_RING_SIZE 32768
+static char ring[BUF_RING_SIZE];
 
 CAMLprim value stub_xc_readconsolering(value xch)
 {
-	unsigned int size = RING_SIZE - 1;
+	unsigned int size = BUF_RING_SIZE - 1;
 	char *ring_ptr = ring;
 	int retval;
 

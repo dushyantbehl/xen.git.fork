@@ -245,11 +245,12 @@ xenaccess_t *xenaccess_init(xc_interface **xch_r, domid_t domain_id)
     mem_event_ring_lock_init(&xenaccess->mem_event);
 
     /* Enable mem_access */
-    xenaccess->mem_event.ring_page =
-            xc_mem_access_enable(xenaccess->xc_handle,
-                                 xenaccess->mem_event.domain_id,
-                                 &xenaccess->mem_event.evtchn_port);
-    if ( xenaccess->mem_event.ring_page == NULL )
+    rc = xc_mem_access_enable(xenaccess->xc_handle,
+                              xenaccess->mem_event.domain_id,
+                              &xenaccess->mem_event.evtchn_port,
+                              xenaccess->mem_event.ring_page,
+                              &xenaccess->mem_event.back_ring);
+    if ( rc < 0 )
     {
         switch ( errno ) {
             case EBUSY:
@@ -286,12 +287,6 @@ xenaccess_t *xenaccess_init(xc_interface **xch_r, domid_t domain_id)
     }
     evtchn_bind = 1;
     xenaccess->mem_event.port = rc;
-
-    /* Initialise ring */
-    SHARED_RING_INIT((mem_event_sring_t *)xenaccess->mem_event.ring_page);
-    BACK_RING_INIT(&xenaccess->mem_event.back_ring,
-                   (mem_event_sring_t *)xenaccess->mem_event.ring_page,
-                   XC_PAGE_SIZE);
 
     /* Get domaininfo */
     xenaccess->domain_info = malloc(sizeof(xc_domaininfo_t));

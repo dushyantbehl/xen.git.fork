@@ -32,6 +32,7 @@
 #include "xenctrl.h"
 #include "xenctrlosdep.h"
 
+#include <xen/mem_event.h>
 #include <xen/sys/privcmd.h>
 
 #if defined(HAVE_VALGRIND_MEMCHECK_H) && !defined(NDEBUG) && !defined(__MINIOS__)
@@ -377,10 +378,13 @@ int xc_mem_event_memop(xc_interface *xch, domid_t domain_id,
                         unsigned int op, unsigned int mode,
                         uint64_t gfn, void *buffer);
 /*
- * Enables mem_event and returns the mapped ring page indicated by param.
+ * Enables mem_event and initializes shared ring to communicate with hypervisor
+ * sets ring_page equal to mapped page.
+ * Returns 0 if success and if failure returns -errno with errno properly set.
  * param can be HVM_PARAM_PAGING/ACCESS/SHARING_RING_PFN
  */
-void *xc_mem_event_enable(xc_interface *xch, domid_t domain_id, int param,
-                          uint32_t *port);
+int xc_mem_event_enable(xc_interface *xch, domid_t domain_id, int param,
+                        uint32_t *port, void *ring_page,
+                        mem_event_back_ring_t *back_ring);
 
 #endif /* __XC_PRIVATE_H__ */
